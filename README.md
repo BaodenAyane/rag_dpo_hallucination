@@ -14,7 +14,7 @@ Current pipeline:
 ## Status
 
 - [x] Data download
-- [ ] BM25 retrieval baseline
+- [x] BM25 retrieval baseline
 - [ ] Baseline generation
 - [ ] Evidence support filtering
 - [ ] SFT data construction
