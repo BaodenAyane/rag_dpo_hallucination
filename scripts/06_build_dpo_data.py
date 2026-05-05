@@ -1,25 +1,41 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 """
 Build DPO training data from evaluated RAG generation outputs.
 
-Recommended first-run command:
+This script assumes you have already run 05_eval_generation.py and produced
+a per-example evaluation JSONL file.
+
+DPO construction rules:
+
+1. Supported context + baseline abstention:
+   chosen   = supported gold answer with evidence citation
+   rejected = baseline abstention
+
+2. Unsupported context + baseline non-abstention:
+   chosen   = Insufficient evidence, explicitly no citation
+   rejected = unsupported baseline answer
+
+Important filtering:
+
+- Supported examples are used conservatively.
+- Unsupported examples are skipped if the baseline predicted answer itself
+  appears supported by the retrieved passages.
+- For yes/no predictions, if the baseline evidence is clearly copied from
+  retrieved passages, the example is skipped as likely ambiguous/gold-mismatch.
+- General evidence overlap is NOT used as a global skip rule, because many
+  hallucinated answers cite irrelevant passages.
+
+Example:
   python scripts/06_build_dpo_data.py \
     --eval_file outputs/baseline/base_train_eval_top10_full.jsonl \
-    --output_file data/preference/dpo_train_top10_full.jsonl \
-    --stats_file outputs/baseline/dpo_train_stats_top10_full.json \
-    --supported_ratio 0.5 \
+    --output_file data/preference/dpo_train_top10_full_u2_lightclean.jsonl \
+    --stats_file outputs/baseline/dpo_train_stats_top10_full_u2_lightclean.json \
+    --supported_ratio 0.333 \
     --supported_mode abstention_only \
+    --max_unsupported_per_supported 2.0 \
     --seed 42
-
-Design principles:
-  1. Prefer high-quality preference pairs over quantity.
-  2. For supported examples, default to only training on baseline abstentions.
-     This avoids noisy pairs where baseline gives a semantically acceptable answer
-     but EM marks it wrong.
-  3. For multi-answer/list-like questions, output all supported gold answers,
-     instead of always selecting the shortest answer.
-  4. For alias-style gold answers, choose one concise supported answer.
-  5. For unsupported examples, train the model to abstain when baseline answered
-     without retrieved evidence.
 """
 
 import argparse
@@ -29,14 +45,56 @@ import random
 import re
 import string
 from collections import Counter
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-# -------------------------
-# IO
-# -------------------------
+ABSTENTION_STRINGS = {
+    "insufficient evidence",
+    "i dont know",
+    "i don't know",
+    "cannot answer",
+    "cant answer",
+    "can't answer",
+    "not enough evidence",
+    "no sufficient evidence",
+    "not supported",
+    "not supported by provided passages",
+    "not supported by the provided passages",
+}
+
+STOPWORDS_FOR_MATCH = {
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "of",
+    "to",
+    "in",
+    "on",
+    "for",
+    "with",
+    "by",
+    "as",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "that",
+    "this",
+    "these",
+    "those",
+    "it",
+    "its",
+    "at",
+    "from",
+}
 
 
-def read_jsonl(path):
+def read_jsonl(path: str) -> Iterable[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -44,28 +102,17 @@ def read_jsonl(path):
                 yield json.loads(line)
 
 
-def write_jsonl(path, rows):
-    output_dir = os.path.dirname(path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     with open(path, "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-# -------------------------
-# Normalization
-# -------------------------
-
-
-def normalize_for_eval(text):
-    """
-    NQ-style normalization for answer equivalence.
-
-    Removes articles and punctuation.
-    Use this for answer comparison, not support matching.
-    """
+def normalize_for_match(text: Any) -> str:
     if text is None:
         return ""
 
@@ -76,64 +123,41 @@ def normalize_for_eval(text):
     return text
 
 
-def normalize_for_support(text):
-    """
-    Stricter normalization for passage support matching.
-
-    Important:
-      Do NOT remove articles here.
-
-    Example:
-      "The Winans" should not become "winans",
-      because that may falsely match "CeCe Winans".
-    """
-    if text is None:
-        return ""
-
-    text = str(text).lower()
-    text = "".join(ch for ch in text if ch not in string.punctuation)
-    text = " ".join(text.split())
-    return text
+def content_tokens(text: Any) -> List[str]:
+    tokens = normalize_for_match(text).split()
+    return [t for t in tokens if t not in STOPWORDS_FOR_MATCH]
 
 
-def token_span_match(normalized_text, normalized_answer):
-    text_tokens = normalized_text.split()
-    answer_tokens = normalized_answer.split()
+def normalize_answer_list(value: Any) -> List[str]:
+    if value is None:
+        return []
 
-    if not text_tokens or not answer_tokens:
-        return False
+    if isinstance(value, str):
+        answers = [value]
+    elif isinstance(value, list):
+        answers = value
+    else:
+        answers = [str(value)]
 
-    n = len(answer_tokens)
-    if n > len(text_tokens):
-        return False
+    cleaned = []
+    seen = set()
 
-    for i in range(len(text_tokens) - n + 1):
-        if text_tokens[i : i + n] == answer_tokens:
-            return True
+    for answer in answers:
+        answer = str(answer).strip()
+        if not answer:
+            continue
 
-    return False
+        key = normalize_for_match(answer)
+        if not key or key in seen:
+            continue
 
+        seen.add(key)
+        cleaned.append(answer)
 
-def contains_answer_for_eval(text, answer):
-    return token_span_match(
-        normalize_for_eval(text),
-        normalize_for_eval(answer),
-    )
-
-
-def contains_answer_for_support(text, answer):
-    return token_span_match(
-        normalize_for_support(text),
-        normalize_for_support(answer),
-    )
+    return cleaned
 
 
-# -------------------------
-# Answer utilities
-# -------------------------
-
-
-def get_all_gold_answers(example):
+def get_gold_answers(example: Dict[str, Any]) -> List[str]:
     answers = (
         example.get("answers")
         or example.get("gold_answers")
@@ -141,289 +165,10 @@ def get_all_gold_answers(example):
         or example.get("gold_answer")
         or []
     )
+    return normalize_answer_list(answers)
 
-    if isinstance(answers, str):
-        answer = answers.strip()
-        return [answer] if answer else []
 
-    if isinstance(answers, list):
-        clean = []
-        seen = set()
-
-        for answer in answers:
-            answer = str(answer).strip()
-            if not answer:
-                continue
-
-            key = normalize_for_eval(answer)
-            if key in seen:
-                continue
-
-            clean.append(answer)
-            seen.add(key)
-
-        return clean
-
-    return []
-
-
-def is_numeric_answer(answer):
-    x = normalize_for_eval(answer)
-
-    if not x:
-        return False
-
-    # Pure number, year, count, etc.
-    if re.fullmatch(r"\d+", x):
-        return True
-
-    # Simple numeric phrase like "13 episodes" is also risky for weak support.
-    tokens = x.split()
-    if tokens and any(tok.isdigit() for tok in tokens):
-        return True
-
-    return False
-
-
-def canonical_answer_for_equivalence(text):
-    """
-    Conservative alias heuristic to reduce noisy DPO pairs.
-
-    This does NOT try to be a full semantic matcher.
-    It only handles common short-answer variants.
-    """
-    x = normalize_for_eval(text)
-
-    alias_map = {
-        "runner up": "second",
-        "runnerup": "second",
-        "second place": "second",
-        "2nd": "second",
-        "came second": "second",
-        "finished second": "second",
-        "second": "second",
-    }
-
-    if x in alias_map:
-        return alias_map[x]
-
-    # Remove common title/honorific prefixes.
-    title_prefixes = [
-        "saint",
-        "st",
-        "sir",
-        "dame",
-        "lord",
-        "lady",
-        "king",
-        "queen",
-        "pope",
-        "president",
-        "prime minister",
-        "dr",
-        "doctor",
-    ]
-
-    for prefix in title_prefixes:
-        if x.startswith(prefix + " "):
-            x = x[len(prefix) + 1 :]
-            break
-
-    return x
-
-
-def answers_look_like_aliases(gold_answers):
-    """
-    Decide whether multiple gold answers are likely aliases of one answer.
-
-    Examples:
-      ["14 December 1972 UTC", "December 1972"] -> aliases
-      ["France", "Russia", "China"] -> not aliases
-    """
-    if len(gold_answers) <= 1:
-        return True
-
-    normalized = [normalize_for_eval(a) for a in gold_answers if normalize_for_eval(a)]
-    if len(normalized) <= 1:
-        return True
-
-    # If all answers share substantial token overlap, treat as aliases.
-    token_sets = [set(x.split()) for x in normalized]
-    common = set.intersection(*token_sets) if token_sets else set()
-
-    if common:
-        return True
-
-    # If one normalized answer is contained as a token span in another,
-    # this is often an alias/shorter variant.
-    for i, a in enumerate(normalized):
-        for j, b in enumerate(normalized):
-            if i == j:
-                continue
-            if token_span_match(b, a) or token_span_match(a, b):
-                return True
-
-    return False
-
-
-def is_list_like_question(question, gold_answers):
-    """
-    Detect questions where multiple gold answers likely need to be output together.
-    """
-    if len(gold_answers) <= 1:
-        return False
-
-    q = normalize_for_eval(question)
-
-    list_cues = [
-        "what are",
-        "what were",
-        "who are",
-        "who were",
-        "which are",
-        "which were",
-        "name the",
-        "list",
-        "give me",
-        "what five",
-        "what 5",
-        "which five",
-        "which 5",
-        "who five",
-        "who 5",
-    ]
-
-    if any(cue in q for cue in list_cues):
-        return True
-
-    number_words = [
-        "two",
-        "three",
-        "four",
-        "five",
-        "six",
-        "seven",
-        "eight",
-        "nine",
-        "ten",
-    ]
-
-    if re.search(r"\b\d+\b", q):
-        return True
-
-    if any(re.search(rf"\b{word}\b", q) for word in number_words):
-        return True
-
-    # Many distinct answers usually means a multi-answer case.
-    if len(gold_answers) >= 4 and not answers_look_like_aliases(gold_answers):
-        return True
-
-    return False
-
-
-def classify_answer_set(question, gold_answers):
-    """
-    Return:
-      "single"       - one gold answer
-      "alias"        - multiple surface forms of same answer
-      "multi"        - multiple different answers may be needed
-    """
-    if len(gold_answers) <= 1:
-        return "single"
-
-    if is_list_like_question(question, gold_answers):
-        return "multi"
-
-    if answers_look_like_aliases(gold_answers):
-        return "alias"
-
-    # Multiple distinct answers, even if question is singular.
-    # Example: multiple singers/actors may be acceptable.
-    return "multi"
-
-
-def join_answers(answers):
-    answers = [str(a).strip() for a in answers if str(a).strip()]
-
-    if not answers:
-        return ""
-
-    if len(answers) == 1:
-        return answers[0]
-
-    if len(answers) == 2:
-        return f"{answers[0]} and {answers[1]}"
-
-    return ", ".join(answers[:-1]) + f", and {answers[-1]}"
-
-
-def baseline_contains_gold_count(text, gold_answers):
-    count = 0
-
-    for answer in gold_answers:
-        if contains_answer_for_eval(text, answer):
-            count += 1
-
-    return count
-
-
-def baseline_is_correct_or_equivalent(example, gold_answers, answer_set_type):
-    """
-    Robust correctness check for deciding whether baseline should be rejected.
-
-    Uses:
-      - EM from 05_eval_generation.py
-      - alias heuristic
-      - token containment in pred_answer
-      - multi-answer coverage when appropriate
-    """
-    if float(example.get("em", 0.0)) > 0.0:
-        return True
-
-    pred_answer = str(example.get("pred_answer", "")).strip()
-    generated_answer = str(example.get("generated_answer", "")).strip()
-
-    pred_norm = canonical_answer_for_equivalence(pred_answer)
-
-    for gold in gold_answers:
-        gold_norm = canonical_answer_for_equivalence(gold)
-
-        if pred_norm and pred_norm == gold_norm:
-            return True
-
-        # Handles cases like:
-        #   pred = "Saint Matthias"
-        #   gold = "Matthias"
-        if pred_answer and contains_answer_for_eval(pred_answer, gold):
-            return True
-
-    if answer_set_type == "multi":
-        pred_hits = baseline_contains_gold_count(pred_answer, gold_answers)
-        gen_hits = baseline_contains_gold_count(generated_answer, gold_answers)
-
-        # For explicit list-like questions, full coverage means correct.
-        if is_list_like_question(str(example.get("question", "")), gold_answers):
-            if pred_hits == len(gold_answers) or gen_hits == len(gold_answers):
-                return True
-
-        # For non-list multi-answer cases, if the baseline gave one accepted gold answer,
-        # do not treat it as a bad rejected answer.
-        if pred_hits >= 1:
-            return True
-
-    return False
-
-
-# -------------------------
-# Passage/prompt utilities
-# -------------------------
-
-
-def get_passage_id(passage, fallback_id):
-    return passage.get("rank", passage.get("pid", passage.get("id", fallback_id)))
-
-
-def get_passage_text(passage):
+def get_passage_text(passage: Dict[str, Any]) -> str:
     title = str(passage.get("title", "")).strip()
     text = str(
         passage.get("text")
@@ -438,17 +183,28 @@ def get_passage_text(passage):
     return text or title
 
 
-def build_context(passages):
+def get_passage_citation_id(passage: Dict[str, Any], fallback_idx: int) -> int:
+    for key in ["rank", "pid", "citation_id"]:
+        if key in passage:
+            try:
+                return int(passage[key])
+            except Exception:
+                pass
+
+    return fallback_idx
+
+
+def build_context(passages: List[Dict[str, Any]]) -> str:
     lines = []
 
     for i, passage in enumerate(passages, start=1):
-        pid = get_passage_id(passage, i)
+        pid = get_passage_citation_id(passage, i)
         lines.append(f"[{pid}] {get_passage_text(passage)}")
 
     return "\n\n".join(lines)
 
 
-def build_prompt(question, passages):
+def build_prompt(question: str, passages: List[Dict[str, Any]]) -> str:
     context = build_context(passages)
 
     return f"""You are a factual retrieval-augmented question answering assistant.
@@ -474,141 +230,284 @@ Passages:
 Now produce the answer in the required format."""
 
 
-# -------------------------
-# Support selection
-# -------------------------
+def token_span_contains(text: Any, answer: Any) -> bool:
+    text_tokens = normalize_for_match(text).split()
+    answer_tokens = normalize_for_match(answer).split()
+
+    if not text_tokens or not answer_tokens:
+        return False
+
+    n = len(answer_tokens)
+    if n > len(text_tokens):
+        return False
+
+    for i in range(len(text_tokens) - n + 1):
+        if text_tokens[i : i + n] == answer_tokens:
+            return True
+
+    return False
 
 
-def build_answer_support_map(passages, gold_answers):
+def relaxed_token_subset_contains(text: Any, answer: Any) -> bool:
     """
-    Map each gold answer to passage ids that contain it under strict support matching.
+    Relaxed containment for short non-numeric answers.
+
+    Catches examples like:
+      answer: "adaptive immunity"
+      text:   "Adaptive (or acquired) immunity"
+
+      answer: "milk, meat, eggs"
+      text:   "milk, meat and eggs"
+
+    Does not aggressively match short numeric answers like "7" or "70".
     """
-    answer_to_ids = {}
+    answer_tokens = content_tokens(answer)
+    text_tokens = set(content_tokens(text))
+
+    if not answer_tokens or not text_tokens:
+        return False
+
+    if len(answer_tokens) == 1:
+        token = answer_tokens[0]
+
+        # Avoid over-filtering numeric answers such as "7", "70", "2001".
+        if token.isdigit():
+            return False
+
+        # Avoid over-filtering very short answers.
+        if len(token) <= 2:
+            return False
+
+    return all(t in text_tokens for t in answer_tokens)
+
+
+def answers_overlap(a: str, b: str) -> bool:
+    na = normalize_for_match(a)
+    nb = normalize_for_match(b)
+
+    if not na or not nb:
+        return False
+
+    if na == nb:
+        return True
+
+    return token_span_contains(na, nb) or token_span_contains(nb, na)
+
+
+def cluster_answers(answers: List[str]) -> List[List[str]]:
+    clusters: List[List[str]] = []
+
+    for answer in answers:
+        placed = False
+
+        for cluster in clusters:
+            if any(answers_overlap(answer, existing) for existing in cluster):
+                cluster.append(answer)
+                placed = True
+                break
+
+        if not placed:
+            clusters.append([answer])
+
+    return clusters
+
+
+def representative_answer(cluster: List[str]) -> str:
+    return sorted(
+        cluster,
+        key=lambda x: (len(normalize_for_match(x).split()), len(x)),
+    )[0]
+
+
+def build_answer_from_supported_gold_answers(
+    supported_answers: List[str],
+) -> Tuple[str, str, List[str]]:
+    clusters = cluster_answers(supported_answers)
+    reps = [representative_answer(cluster) for cluster in clusters]
+
+    if len(reps) == 1:
+        return reps[0], "single", reps
+
+    return ", ".join(reps), "multi", reps
+
+
+def is_pure_numeric_answer(answer: str) -> bool:
+    norm = normalize_for_match(answer)
+    return bool(re.fullmatch(r"\d+(?:\.\d+)?", norm))
+
+
+def find_supported_gold_answers_and_passages(
+    gold_answers: List[str],
+    passages: List[Dict[str, Any]],
+) -> Tuple[List[str], List[int]]:
+    supported_answers = []
+    supporting_ids = set()
 
     for answer in gold_answers:
-        ids = []
+        found = False
 
         for i, passage in enumerate(passages, start=1):
-            pid = get_passage_id(passage, i)
             passage_text = get_passage_text(passage)
 
-            if contains_answer_for_support(passage_text, answer):
-                ids.append(pid)
+            if token_span_contains(passage_text, answer):
+                found = True
+                supporting_ids.add(get_passage_citation_id(passage, i))
 
-        if ids:
-            answer_to_ids[answer] = ids
+        if found:
+            supported_answers.append(answer)
 
-    return answer_to_ids
-
-
-def select_chosen_answer_and_support(
-    question,
-    passages,
-    gold_answers,
-    allow_numeric_supported,
-):
-    """
-    Select chosen answer text and supporting passage ids.
-
-    For alias/single answer:
-      choose one supported answer.
-
-    For multi-answer cases:
-      output all supported gold answers, not just the shortest one.
-    """
-    answer_set_type = classify_answer_set(question, gold_answers)
-    answer_to_ids = build_answer_support_map(passages, gold_answers)
-
-    if not answer_to_ids:
-        return "", [], answer_set_type, []
-
-    if answer_set_type == "multi":
-        supported_answers = [a for a in gold_answers if a in answer_to_ids]
-
-        # For explicit list-like questions, require every listed gold answer to be supported.
-        # Otherwise we risk training incomplete list answers.
-        if is_list_like_question(question, gold_answers):
-            if len(supported_answers) < len(gold_answers):
-                return "", [], answer_set_type, supported_answers
-
-        if not allow_numeric_supported:
-            if any(is_numeric_answer(a) for a in supported_answers):
-                return "", [], answer_set_type, supported_answers
-
-        chosen_answer = join_answers(supported_answers)
-
-        # Prefer one passage that supports all selected answers if available.
-        all_ids = []
-        for ids in answer_to_ids.values():
-            all_ids.extend(ids)
-
-        unique_ids = []
-        for pid in all_ids:
-            if pid not in unique_ids:
-                unique_ids.append(pid)
-
-        return chosen_answer, unique_ids, answer_set_type, supported_answers
-
-    # single / alias case
-    supported_answers = [a for a in gold_answers if a in answer_to_ids]
-
-    # Choose a concise supported answer for alias-style answers.
-    supported_answers.sort(key=lambda x: (len(x.split()), len(x)))
-    chosen_answer = supported_answers[0]
-
-    if not allow_numeric_supported and is_numeric_answer(chosen_answer):
-        return "", [], answer_set_type, supported_answers
-
-    return chosen_answer, answer_to_ids[chosen_answer], answer_set_type, supported_answers
+    return supported_answers, sorted(supporting_ids)
 
 
-def build_supported_chosen(chosen_answer, supporting_passage_ids):
-    citation_text = " ".join(f"[{pid}]" for pid in supporting_passage_ids[:3])
+def parse_citations(answer: Any) -> List[int]:
+    if answer is None:
+        return []
 
-    return (
-        f"Answer: {chosen_answer}\n"
-        f"Evidence: The answer is supported by passage {citation_text}."
-    )
-
-
-def build_unsupported_chosen():
-    return (
-        "Answer: Insufficient evidence\n"
-        "Evidence: The provided passages do not contain enough information to infer the answer."
-    )
+    citation_ids = re.findall(r"\[(\d+)\]", str(answer))
+    return sorted(set(int(cid) for cid in citation_ids))
 
 
-# -------------------------
-# Labels
-# -------------------------
-
-
-def is_abstention(example):
+def is_abstention(example: Dict[str, Any]) -> bool:
     if "abstained" in example:
         return bool(example["abstained"])
 
     if "is_abstention" in example:
         return bool(example["is_abstention"])
 
-    output = normalize_for_eval(example.get("generated_answer", ""))
+    text = normalize_for_match(example.get("generated_answer", ""))
 
-    abstention_patterns = [
-        "i dont know",
-        "insufficient evidence",
-        "provided evidence is insufficient",
-        "not enough evidence",
-        "cannot answer",
-        "cant answer",
-        "not supported by provided passages",
-        "not supported by the provided passages",
-        "no sufficient evidence",
-        "evidence is insufficient",
-    ]
-
-    return any(pattern in output for pattern in abstention_patterns)
+    return any(pattern in text for pattern in ABSTENTION_STRINGS)
 
 
-def is_supported(example):
+def is_em_correct(example: Dict[str, Any]) -> bool:
+    return float(example.get("em", 0.0)) > 0.0
+
+
+def prediction_equivalent_or_contained_in_gold(example: Dict[str, Any]) -> bool:
+    pred = str(example.get("pred_answer", "")).strip()
+
+    if not pred:
+        return False
+
+    pred_norm = normalize_for_match(pred)
+
+    if not pred_norm:
+        return False
+
+    if any(pattern == pred_norm or pattern in pred_norm for pattern in ABSTENTION_STRINGS):
+        return False
+
+    for gold in get_gold_answers(example):
+        if answers_overlap(pred, gold):
+            return True
+
+    return False
+
+
+def extract_evidence_text(generated_answer: Any) -> str:
+    text = str(generated_answer or "").strip()
+
+    match = re.search(r"(?is)\bevidence\s*:\s*(.*)$", text)
+    if match:
+        evidence = match.group(1).strip()
+    else:
+        evidence = text
+
+    evidence = re.sub(r"\[\d+\]", "", evidence)
+    evidence = evidence.strip().strip("\"'`").strip()
+
+    return evidence
+
+
+def evidence_appears_in_passages(
+    example: Dict[str, Any],
+    passages: List[Dict[str, Any]],
+) -> bool:
+    """
+    Used only for yes/no predictions.
+
+    If model says yes/no and its evidence is clearly copied from passages,
+    the sample is likely an ambiguous or gold-mismatch case rather than
+    clean unsupported hallucination.
+    """
+    evidence = extract_evidence_text(example.get("generated_answer", ""))
+
+    if not evidence:
+        return False
+
+    evidence_norm = normalize_for_match(evidence)
+
+    if not evidence_norm:
+        return False
+
+    if "insufficient evidence" in evidence_norm:
+        return False
+
+    evidence_tokens = content_tokens(evidence)
+
+    if len(evidence_tokens) < 4:
+        return False
+
+    for passage in passages:
+        passage_text = get_passage_text(passage)
+        passage_norm = normalize_for_match(passage_text)
+
+        if evidence_norm and evidence_norm in passage_norm:
+            return True
+
+        passage_tokens = set(content_tokens(passage_text))
+        overlap = sum(1 for t in evidence_tokens if t in passage_tokens)
+        overlap_ratio = overlap / max(1, len(evidence_tokens))
+
+        if overlap_ratio >= 0.6:
+            return True
+
+    return False
+
+
+def baseline_answer_in_passages(
+    example: Dict[str, Any],
+    passages: List[Dict[str, Any]],
+) -> bool:
+    """
+    Light noise filter for unsupported DPO pairs.
+
+    Skip only when the baseline short answer itself appears to be supported
+    by retrieved passages.
+
+    Important:
+    Do NOT skip all examples whose evidence overlaps with passages, because
+    hallucinated answers often quote or cite irrelevant passages.
+    """
+    pred = str(example.get("pred_answer", "")).strip()
+    pred_norm = normalize_for_match(pred)
+
+    if not pred_norm:
+        return False
+
+    if any(pattern == pred_norm or pattern in pred_norm for pattern in ABSTENTION_STRINGS):
+        return False
+
+    context = " ".join(get_passage_text(p) for p in passages)
+
+    # Strict answer span match.
+    # Avoid over-filtering short numeric predictions such as 7, 70, 2001.
+    if not pred_norm.isdigit() and token_span_contains(context, pred):
+        return True
+
+    # Relaxed answer token matching.
+    if relaxed_token_subset_contains(context, pred):
+        return True
+
+    # Yes/no answers cannot be matched by answer span.
+    # If evidence is clearly passage-grounded, skip as noisy.
+    if pred_norm in {"yes", "no"} and evidence_appears_in_passages(example, passages):
+        return True
+
+    return False
+
+
+def is_supported(example: Dict[str, Any]) -> bool:
     if "answer_in_retrieved" in example:
         return bool(example["answer_in_retrieved"])
 
@@ -619,84 +518,116 @@ def is_supported(example):
     return False
 
 
-# -------------------------
-# Sampling
-# -------------------------
+def build_supported_chosen(
+    chosen_answer: str,
+    supporting_passage_ids: List[int],
+) -> str:
+    if supporting_passage_ids:
+        citations = " ".join(f"[{pid}]" for pid in supporting_passage_ids[:2])
+    else:
+        citations = "[1]"
+
+    return (
+        f"Answer: {chosen_answer}\n"
+        f"Evidence: The answer is supported by passage {citations}."
+    )
 
 
-def select_final_pairs(
-    supported_pairs,
-    unsupported_pairs,
-    supported_ratio,
-    max_unsupported_per_supported,
-):
-    """
-    Select final DPO rows.
+def build_unsupported_chosen() -> str:
+    return (
+        "Answer: Insufficient evidence\n"
+        "Evidence: The provided passages do not contain enough information to infer the answer. "
+        "Do not cite any passage because none of the provided passages supports the answer."
+    )
 
-    We keep all clean supported pairs when possible, then downsample unsupported
-    pairs so DPO does not become too abstention-heavy.
-    """
-    random.shuffle(supported_pairs)
-    random.shuffle(unsupported_pairs)
+
+def maybe_limit_unsupported_pairs(
+    supported_pairs: List[Dict[str, Any]],
+    unsupported_pairs: List[Dict[str, Any]],
+    max_unsupported_per_supported: Optional[float],
+) -> List[Dict[str, Any]]:
+    if max_unsupported_per_supported is None:
+        return unsupported_pairs
+
+    if max_unsupported_per_supported < 0:
+        return unsupported_pairs
+
+    max_unsupported = int(len(supported_pairs) * max_unsupported_per_supported)
+    return unsupported_pairs[:max_unsupported]
+
+
+def select_pairs_by_ratio(
+    supported_pairs: List[Dict[str, Any]],
+    unsupported_pairs: List[Dict[str, Any]],
+    supported_ratio: float,
+    max_unsupported_per_supported: Optional[float],
+) -> List[Dict[str, Any]]:
+    if not 0.0 <= supported_ratio <= 1.0:
+        raise ValueError("--supported_ratio must be between 0 and 1.")
 
     if not supported_pairs and not unsupported_pairs:
         return []
 
-    if not supported_pairs:
-        return unsupported_pairs
+    unsupported_pairs = maybe_limit_unsupported_pairs(
+        supported_pairs=supported_pairs,
+        unsupported_pairs=unsupported_pairs,
+        max_unsupported_per_supported=max_unsupported_per_supported,
+    )
 
-    if supported_ratio <= 0:
-        selected = unsupported_pairs
-        random.shuffle(selected)
-        return selected
+    if supported_ratio == 1.0:
+        final_rows = supported_pairs
+        random.shuffle(final_rows)
+        return final_rows
 
-    # Use all supported pairs.
-    selected_supported = supported_pairs
+    if supported_ratio == 0.0:
+        final_rows = unsupported_pairs
+        random.shuffle(final_rows)
+        return final_rows
 
-    # Target unsupported count implied by supported_ratio:
-    # supported / (supported + unsupported) = supported_ratio
-    target_unsupported = int(len(selected_supported) * (1.0 - supported_ratio) / supported_ratio)
+    # Prefer using all supported pairs, because supported pairs are fewer.
+    target_unsupported = int(
+        round(len(supported_pairs) * (1.0 - supported_ratio) / supported_ratio)
+    )
 
-    if max_unsupported_per_supported is not None and max_unsupported_per_supported >= 0:
-        capped_unsupported = int(len(selected_supported) * max_unsupported_per_supported)
-        target_unsupported = min(target_unsupported, capped_unsupported)
+    if len(unsupported_pairs) >= target_unsupported:
+        selected_supported = supported_pairs
+        selected_unsupported = unsupported_pairs[:target_unsupported]
+    else:
+        selected_unsupported = unsupported_pairs
 
-    target_unsupported = max(0, target_unsupported)
-    selected_unsupported = unsupported_pairs[: min(len(unsupported_pairs), target_unsupported)]
+        target_supported = int(
+            round(len(unsupported_pairs) * supported_ratio / (1.0 - supported_ratio))
+        )
+        selected_supported = supported_pairs[:target_supported]
 
-    rows = selected_supported + selected_unsupported
-    random.shuffle(rows)
-    return rows
-
-
-# -------------------------
-# Main construction
-# -------------------------
+    final_rows = selected_supported + selected_unsupported
+    random.shuffle(final_rows)
+    return final_rows
 
 
 def build_dpo_data(
-    eval_file,
-    output_file,
-    stats_file,
-    supported_ratio,
-    supported_mode,
-    allow_numeric_supported,
-    max_unsupported_per_supported,
-    seed,
-):
+    eval_file: str,
+    output_file: str,
+    stats_file: Optional[str],
+    supported_ratio: float,
+    supported_mode: str,
+    max_unsupported_per_supported: Optional[float],
+    seed: int,
+    filter_numeric_supported: bool,
+) -> None:
     random.seed(seed)
 
-    supported_pairs = []
-    unsupported_pairs = []
+    supported_pairs: List[Dict[str, Any]] = []
+    unsupported_pairs: List[Dict[str, Any]] = []
     stats = Counter()
 
     for ex in read_jsonl(eval_file):
         stats["num_examples"] += 1
 
+        ex_id = ex.get("id")
         question = str(ex.get("question", "")).strip()
         passages = ex.get("retrieved_passages") or ex.get("passages") or []
         rejected = str(ex.get("generated_answer", "")).strip()
-        gold_answers = get_all_gold_answers(ex)
 
         if not question:
             stats["skipped_missing_question"] += 1
@@ -710,59 +641,66 @@ def build_dpo_data(
             stats["skipped_missing_rejected"] += 1
             continue
 
-        if not gold_answers:
-            stats["skipped_missing_gold_answers"] += 1
-            continue
-
-        prompt = ex.get("prompt") or build_prompt(question, passages)
+        prompt = build_prompt(question, passages)
 
         supported = is_supported(ex)
         abstained = is_abstention(ex)
-
-        answer_set_type = classify_answer_set(question, gold_answers)
-        correct = baseline_is_correct_or_equivalent(ex, gold_answers, answer_set_type)
-        em_correct = float(ex.get("em", 0.0)) > 0.0
-
-        if correct and not em_correct:
-            stats["non_em_but_equivalent_or_contained"] += 1
+        em_correct = is_em_correct(ex)
+        equivalent_or_contained = prediction_equivalent_or_contained_in_gold(ex)
+        baseline_citation_ids = parse_citations(rejected)
 
         if supported:
             stats["supported_examples"] += 1
 
-            chosen_answer, supporting_ids, answer_set_type, supported_gold_answers = (
-                select_chosen_answer_and_support(
-                    question=question,
-                    passages=passages,
-                    gold_answers=gold_answers,
-                    allow_numeric_supported=allow_numeric_supported,
-                )
+            gold_answers = get_gold_answers(ex)
+
+            if not gold_answers:
+                stats["skipped_missing_gold_answer"] += 1
+                continue
+
+            supported_gold_answers, supporting_passage_ids = (
+                find_supported_gold_answers_and_passages(gold_answers, passages)
             )
 
-            if not chosen_answer or not supporting_ids:
+            if not supported_gold_answers or not supporting_passage_ids:
                 stats["supported_missing_or_filtered_support"] += 1
-
-                if any(is_numeric_answer(a) for a in gold_answers):
-                    stats["supported_numeric_filtered"] += 1
-
                 continue
+
+            if filter_numeric_supported and all(
+                is_pure_numeric_answer(answer) for answer in supported_gold_answers
+            ):
+                stats["supported_numeric_filtered"] += 1
+                continue
+
+            chosen_answer, answer_set_type, chosen_answer_list = (
+                build_answer_from_supported_gold_answers(supported_gold_answers)
+            )
 
             if answer_set_type == "multi":
                 stats["supported_multi_answer_candidates"] += 1
 
-            # Default high-quality mode:
-            # only use supported examples where baseline abstained.
+            should_make_supported_pair = False
+
             if supported_mode == "abstention_only":
+                should_make_supported_pair = abstained
                 if not abstained:
                     stats["supported_non_abstain_skipped"] += 1
-                    continue
-            else:
-                # Less conservative mode:
-                # use abstained or clearly incorrect examples.
-                if correct:
+            elif supported_mode == "wrong_or_abstain":
+                should_make_supported_pair = abstained or not em_correct
+                if em_correct and not abstained:
                     stats["supported_already_correct"] += 1
-                    continue
+            else:
+                raise ValueError(
+                    "--supported_mode must be either 'abstention_only' or 'wrong_or_abstain'."
+                )
 
-            chosen = build_supported_chosen(chosen_answer, supporting_ids)
+            if not should_make_supported_pair:
+                continue
+
+            chosen = build_supported_chosen(
+                chosen_answer=chosen_answer,
+                supporting_passage_ids=supporting_passage_ids,
+            )
 
             supported_pairs.append(
                 {
@@ -770,29 +708,36 @@ def build_dpo_data(
                     "chosen": chosen,
                     "rejected": rejected,
                     "type": "supported_answer",
-                    "id": ex.get("id"),
+                    "id": ex_id,
                     "question": question,
                     "chosen_answer": chosen_answer,
                     "gold_answers": gold_answers,
-                    "supported_gold_answers": supported_gold_answers,
+                    "supported_gold_answers": chosen_answer_list,
                     "answer_set_type": answer_set_type,
-                    "supporting_passage_ids": supporting_ids,
+                    "supporting_passage_ids": supporting_passage_ids,
                     "baseline_pred_answer": ex.get("pred_answer"),
                     "baseline_abstained": abstained,
-                    "baseline_correct": correct,
+                    "baseline_correct": em_correct,
                     "baseline_em_correct": em_correct,
                     "answer_in_retrieved": supported,
-                    "baseline_citation_ids": ex.get("citation_ids", []),
+                    "baseline_citation_ids": baseline_citation_ids,
                 }
             )
-
             stats["supported_pairs"] += 1
 
         else:
             stats["unsupported_examples"] += 1
 
-            if correct:
+            if em_correct:
                 stats["unsupported_but_correct_skipped"] += 1
+                continue
+
+            if equivalent_or_contained:
+                stats["non_em_but_equivalent_or_contained"] += 1
+                continue
+
+            if baseline_answer_in_passages(ex, passages):
+                stats["unsupported_baseline_answer_in_passages_skipped"] += 1
                 continue
 
             if abstained:
@@ -807,22 +752,25 @@ def build_dpo_data(
                     "chosen": chosen,
                     "rejected": rejected,
                     "type": "unsupported_abstention",
-                    "id": ex.get("id"),
+                    "id": ex_id,
                     "question": question,
-                    "gold_answers": gold_answers,
-                    "answer_set_type": answer_set_type,
+                    "gold_answers": get_gold_answers(ex),
+                    "answer_set_type": "single",
                     "baseline_pred_answer": ex.get("pred_answer"),
                     "baseline_abstained": abstained,
-                    "baseline_correct": correct,
+                    "baseline_correct": em_correct,
                     "baseline_em_correct": em_correct,
                     "answer_in_retrieved": supported,
-                    "baseline_citation_ids": ex.get("citation_ids", []),
+                    "baseline_citation_ids": baseline_citation_ids,
+                    "baseline_answer_in_passages": False,
                 }
             )
-
             stats["unsupported_pairs"] += 1
 
-    dpo_rows = select_final_pairs(
+    random.shuffle(supported_pairs)
+    random.shuffle(unsupported_pairs)
+
+    dpo_rows = select_pairs_by_ratio(
         supported_pairs=supported_pairs,
         unsupported_pairs=unsupported_pairs,
         supported_ratio=supported_ratio,
@@ -835,11 +783,15 @@ def build_dpo_data(
     stats["available_unsupported_pairs"] = len(unsupported_pairs)
     stats["final_dpo_examples"] = len(dpo_rows)
     stats["final_supported_pairs"] = sum(
-        row["type"] == "supported_answer" for row in dpo_rows
+        x["type"] == "supported_answer" for x in dpo_rows
     )
     stats["final_unsupported_pairs"] = sum(
-        row["type"] == "unsupported_abstention" for row in dpo_rows
+        x["type"] == "unsupported_abstention" for x in dpo_rows
     )
+    stats["supported_ratio_requested"] = supported_ratio
+    stats["max_unsupported_per_supported"] = max_unsupported_per_supported
+    stats["supported_mode"] = supported_mode
+    stats["filter_numeric_supported"] = filter_numeric_supported
 
     if stats_file:
         stats_dir = os.path.dirname(stats_file)
@@ -852,60 +804,48 @@ def build_dpo_data(
     print(json.dumps(dict(stats), ensure_ascii=False, indent=2))
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--eval_file", required=True)
     parser.add_argument("--output_file", required=True)
     parser.add_argument("--stats_file", default=None)
-
     parser.add_argument(
         "--supported_ratio",
         type=float,
         default=0.5,
         help=(
-            "Target fraction of supported pairs in final DPO data. "
-            "Recommended: 0.5 for balanced supported/unsupported training."
+            "Target ratio of supported-answer pairs in final DPO data. "
+            "For example, 0.333 gives roughly supported:unsupported = 1:2."
         ),
     )
-
     parser.add_argument(
         "--supported_mode",
-        choices=["abstention_only", "wrong_and_abstention"],
+        type=str,
         default="abstention_only",
+        choices=["abstention_only", "wrong_or_abstain"],
         help=(
-            "abstention_only is cleaner and recommended. "
-            "wrong_and_abstention includes supported wrong non-abstain examples, "
-            "but may introduce more noise."
+            "How to build supported-answer pairs. "
+            "'abstention_only' only uses supported examples where the baseline abstained. "
+            "'wrong_or_abstain' also uses supported examples where the baseline was EM-wrong."
         ),
     )
-
-    parser.add_argument(
-        "--allow_numeric_supported",
-        action="store_true",
-        help=(
-            "Allow supported pairs with numeric answers. "
-            "Default is to skip them because numeric answers often create false "
-            "positive support under weak string matching."
-        ),
-    )
-
     parser.add_argument(
         "--max_unsupported_per_supported",
         type=float,
-        default=1.0,
+        default=None,
         help=(
-            "Cap final unsupported pairs relative to supported pairs. "
-            "Use 1.0 for roughly balanced data."
+            "Optional cap on unsupported pairs per supported pair. "
+            "For example, 2.0 means at most 2 unsupported pairs for each supported pair."
         ),
     )
-
+    parser.add_argument(
+        "--no_filter_numeric_supported",
+        action="store_true",
+        help="Disable filtering of short purely numeric supported answers.",
+    )
     parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
-
-    if not 0.0 <= args.supported_ratio <= 1.0:
-        raise ValueError("--supported_ratio must be between 0 and 1.")
 
     build_dpo_data(
         eval_file=args.eval_file,
@@ -913,11 +853,12 @@ def main():
         stats_file=args.stats_file,
         supported_ratio=args.supported_ratio,
         supported_mode=args.supported_mode,
-        allow_numeric_supported=args.allow_numeric_supported,
         max_unsupported_per_supported=args.max_unsupported_per_supported,
         seed=args.seed,
+        filter_numeric_supported=not args.no_filter_numeric_supported,
     )
 
 
 if __name__ == "__main__":
     main()
+    
