@@ -1,31 +1,19 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 """
-Generate baseline RAG answers from retrieved passages with batched inference.
+Generate RAG answers with a DPO LoRA adapter.
 
 Example:
-  python scripts/04_generate_baseline.py \
-    --retrieval_file data/retrieval/nq_train_bm25_top10_full.jsonl \
-    --output data/generation/base_train_outputs_top10_full.jsonl \
+  CUDA_VISIBLE_DEVICES=0 python -u scripts/08_generate_dpo.py \
+    --retrieval_file data/retrieval/nq_validation_bm25_top10_full.jsonl \
+    --output data/generation/dpo_val_outputs_top10_full.jsonl \
     --model_name Qwen/Qwen2.5-7B-Instruct \
+    --adapter_dir outputs/dpo/qwen2_5_7b_rag_dpo_top10_full_1epoch_len3328_lr1e6 \
     --top_k 10 \
     --max_new_tokens 64 \
     --max_input_length 4096 \
-    --batch_size 8 \
-    --resume
-
-Multi-GPU sharding example:
-  CUDA_VISIBLE_DEVICES=0 python scripts/04_generate_baseline.py \
-    --retrieval_file data/retrieval/nq_train_bm25_top10_full.jsonl \
-    --output data/generation/base_train_outputs_top10_full_part0.jsonl \
-    --model_name Qwen/Qwen2.5-7B-Instruct \
-    --top_k 10 --max_new_tokens 64 --max_input_length 4096 \
-    --batch_size 4 --start_index 0 --end_index 5000
-
-  CUDA_VISIBLE_DEVICES=1 python scripts/04_generate_baseline.py \
-    --retrieval_file data/retrieval/nq_train_bm25_top10_full.jsonl \
-    --output data/generation/base_train_outputs_top10_full_part1.jsonl \
-    --model_name Qwen/Qwen2.5-7B-Instruct \
-    --top_k 10 --max_new_tokens 64 --max_input_length 4096 \
-    --batch_size 4 --start_index 5000 --end_index 10000
+    --batch_size 4
 """
 
 import argparse
@@ -35,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Set
 
 import torch
+from peft import PeftModel
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -49,6 +38,7 @@ def read_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
 
 def load_existing_ids(path: Path) -> Set[str]:
     existing_ids = set()
+
     if not path.exists():
         return existing_ids
 
@@ -106,7 +96,7 @@ Passages:
 Now produce the answer in the required format."""
 
 
-def load_model_and_tokenizer(model_name: str):
+def load_model_and_tokenizer(model_name: str, adapter_dir: Path):
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=True,
@@ -117,11 +107,17 @@ def load_model_and_tokenizer(model_name: str):
 
     tokenizer.padding_side = "left"
 
-    model = AutoModelForCausalLM.from_pretrained(
+    base_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True,
+    )
+
+    print(f"Loading LoRA adapter from: {adapter_dir}")
+    model = PeftModel.from_pretrained(
+        base_model,
+        adapter_dir,
     )
 
     model.eval()
@@ -196,7 +192,7 @@ def generate_answers_batch(
         skip_special_tokens=True,
     )
 
-    return [a.strip() for a in answers]
+    return [answer.strip() for answer in answers]
 
 
 def main() -> None:
@@ -204,6 +200,7 @@ def main() -> None:
     parser.add_argument("--retrieval_file", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--adapter_dir", type=Path, required=True)
     parser.add_argument("--top_k", type=int, default=10)
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--max_input_length", type=int, default=4096)
@@ -211,23 +208,17 @@ def main() -> None:
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_examples", type=int, default=None)
-    parser.add_argument("--start_index", type=int, default=0)
-    parser.add_argument("--end_index", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
     records = list(read_jsonl(args.retrieval_file))
 
-    if args.end_index is not None:
-        records = records[args.start_index : args.end_index]
-    else:
-        records = records[args.start_index :]
-
     if args.max_examples is not None:
         records = records[: args.max_examples]
 
     print(f"Loaded {len(records)} retrieval examples")
-    print(f"Loading model: {args.model_name}")
+    print(f"Base model: {args.model_name}")
+    print(f"Adapter: {args.adapter_dir}")
     print(
         f"top_k={args.top_k}, "
         f"max_new_tokens={args.max_new_tokens}, "
@@ -235,7 +226,10 @@ def main() -> None:
         f"batch_size={args.batch_size}"
     )
 
-    model, tokenizer = load_model_and_tokenizer(args.model_name)
+    model, tokenizer = load_model_and_tokenizer(
+        model_name=args.model_name,
+        adapter_dir=args.adapter_dir,
+    )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -263,17 +257,20 @@ def main() -> None:
         for batch in tqdm(
             batch_iter(filtered_records, args.batch_size),
             total=(len(filtered_records) + args.batch_size - 1) // args.batch_size,
-            desc="Generating baseline answers",
+            desc="Generating DPO answers",
         ):
             prompts = []
+
             for record in batch:
                 question = str(record["question"])
                 retrieved_passages = record.get("retrieved_passages", [])
+
                 prompt = build_prompt(
                     question=question,
                     passages=retrieved_passages,
                     top_k=args.top_k,
                 )
+
                 prompts.append(prompt)
 
             generated_answers = generate_answers_batch(
@@ -295,6 +292,7 @@ def main() -> None:
                     "prompt": prompt,
                     "generated_answer": generated_answer,
                     "model_name": args.model_name,
+                    "adapter_dir": str(args.adapter_dir),
                     "top_k": args.top_k,
                     "max_new_tokens": args.max_new_tokens,
                     "max_input_length": args.max_input_length,
@@ -308,7 +306,7 @@ def main() -> None:
     elapsed = time.time() - start_time
     speed = num_written / elapsed if elapsed > 0 else 0.0
 
-    print(f"Saved baseline generations to {args.output}")
+    print(f"Saved DPO generations to {args.output}")
     print(f"Written examples: {num_written}")
     print(f"Elapsed seconds: {elapsed:.2f}")
     print(f"Speed: {speed:.2f} examples/sec")

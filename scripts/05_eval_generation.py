@@ -3,9 +3,9 @@ Evaluate baseline RAG generations.
 
 Example:
   python scripts/05_eval_generation.py \
-    --generation_file data/generation/base_val_outputs_top10_full.jsonl \
-    --output_file outputs/baseline/base_val_metrics_top10_full.json \
-    --per_example_output outputs/baseline/base_val_eval_top10_full.jsonl
+    --generation_file data/generation/base_validation_outputs_top10_full.jsonl \
+    --output_file outputs/baseline/base_validation_metrics_top10_full.json \
+    --per_example_output outputs/baseline/base_validation_eval_top10_full.jsonl
 """
 
 import argparse
