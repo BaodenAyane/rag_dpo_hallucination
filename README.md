@@ -2,7 +2,9 @@
 
 This project studies whether preference optimization can reduce hallucination in retrieval-augmented generation.
 
-The main experiment uses NQ-Open questions, Wiki DPR passages, Pyserini BM25 retrieval, and Qwen2.5-7B-Instruct as the RAG generator. The goal is to train the generator to better distinguish between supported and unsupported retrieval contexts.
+The main experiment uses NQ-Open questions, Wiki DPR passages, Pyserini BM25 retrieval, and Qwen2.5-7B-Instruct as the RAG generator. The goal is to study whether weak-label Direct Preference Optimization (DPO) can improve evidence-grounded answering and reduce hallucination in RAG.
+
+The main finding is cautionary: weak-label DPO produces only modest answer-quality gains, while naive DPO can substantially amplify unfaithful citation behavior. A cleaner DPO variant mitigates citation misuse, but does not outperform the original baseline on overall hallucination-related metrics.
 
 ## Current Pipeline
 
@@ -11,11 +13,12 @@ The main experiment uses NQ-Open questions, Wiki DPR passages, Pyserini BM25 ret
 3. Retrieve top-k passages for NQ-Open questions.
 4. Evaluate weak retrieval recall by checking whether any gold answer appears in retrieved passages.
 5. Generate baseline RAG answers with Qwen2.5-7B-Instruct.
-6. Evaluate baseline generations with EM/F1, citation rate, abstention rate, and retrieved-answer support.
+6. Evaluate baseline generations with EM/F1, citation rate, abstention rate, and weak retrieved-answer support.
 7. Build DPO preference pairs from baseline generation behavior.
 8. Train the generator with LoRA DPO.
 9. Generate answers with the DPO-tuned model.
-10. Compare baseline vs DPO on validation metrics.
+10. Compare baseline vs DPO variants using automatic metrics.
+11. Run an LLM verifier audit to evaluate answer correctness, passage support, citation faithfulness, and hallucination.
 
 ## Status
 
@@ -35,7 +38,9 @@ The main experiment uses NQ-Open questions, Wiki DPR passages, Pyserini BM25 ret
 - [x] DPO-v2-lightclean training
 - [x] DPO-v2-lightclean generation
 - [x] DPO-v2-lightclean evaluation
-- [x] Baseline vs DPO-v1 vs DPO-v2 comparison
+- [x] Baseline vs DPO-v1 vs DPO-v2 automatic comparison
+- [x] Full-validation LLM verifier audit
+- [x] Final analysis
 
 ## Experimental Setup
 
@@ -48,6 +53,7 @@ The main experiment uses NQ-Open questions, Wiki DPR passages, Pyserini BM25 ret
 - Generation max input length: 4096
 - DPO method: LoRA DPO
 - DPO data source: baseline RAG generation outputs
+- LLM verifier: external OpenAI-compatible judge API
 
 ## DPO Training Setup
 
@@ -79,6 +85,25 @@ The main experiment uses NQ-Open questions, Wiki DPR passages, Pyserini BM25 ret
 - Training: 2-GPU DDP data parallelism
 
 ## DPO Data Construction
+
+### Weak Support Definition
+
+The project uses a weak automatic support proxy:
+
+```text
+answer_in_retrieved = whether any gold answer string appears in the retrieved passages
+```
+
+This is not a human-verified support label. Therefore, the supported/unsupported split should be interpreted as:
+
+```text
+gold-in-retrieved
+gold-not-in-retrieved
+```
+
+rather than strict evidence-supported and evidence-unsupported labels.
+
+This limitation is important because some examples marked as unsupported may still contain semantically useful evidence, aliases, partially relevant evidence, or noisy gold labels.
 
 ### DPO-v1
 
@@ -130,11 +155,11 @@ DPO-v2-lightclean train data statistics:
 }
 ```
 
-## Validation Results
+## Automatic Validation Results
 
 Validation set size: 3610 examples.
 
-Detailed results are available in:
+Detailed automatic results are available in:
 
 ```text
 results/baseline_vs_dpo_v1_v2.md
@@ -159,33 +184,89 @@ results/baseline_vs_dpo_v1_v2.md
 | Unsupported Citation Rate | 0.2468 | 0.7766 | 0.4025 |
 | Unsupported Abstention Rate | 0.5601 | 0.5057 | 0.5146 |
 
+### Notes on Automatic Metrics
+
+The automatic evaluation is useful for measuring EM/F1, abstention behavior, and citation-format behavior. However, it has two important limitations:
+
+1. `valid_citation_rate` only checks whether citation IDs refer to retrieved passages. It does not check whether the cited passages actually support the answer.
+2. The supported/unsupported split is based on gold-answer string matching, not human-verified evidence support.
+
+Therefore, automatic unsupported EM/F1 should be interpreted cautiously. Higher unsupported EM/F1 may indicate that the model answers more often or uses parametric knowledge, rather than that its answers are grounded in retrieved evidence.
+
+## LLM Verifier Audit
+
+To evaluate grounding more directly, this project also runs a full-validation LLM verifier audit.
+
+The verifier judges each system output using the question, gold answers, retrieved passages, and generated answer. It labels:
+
+- answer type
+- gold correctness
+- passage support
+- citation faithfulness
+- hallucination
+
+The verifier is instructed to judge passage support only from the retrieved passages and not to use outside knowledge for evidence support.
+
+### LLM Verifier Results
+
+| Metric | Baseline | DPO-v1 | DPO-v2-lightclean |
+|---|---:|---:|---:|
+| Answer Rate | 65.82% | 69.83% | 69.72% |
+| Abstention Rate | 34.13% | 30.17% | 30.25% |
+| Gold Correct / Partial | 42.27% | 44.24% | 43.79% |
+| Passage Supported / Partial | 51.91% | 52.44% | 53.13% |
+| Unfaithful Citation Rate | 9.45% | 37.70% | 17.29% |
+| No Citation Rate | 58.64% | 12.24% | 41.41% |
+| Hallucination / Partial | 16.68% | 19.70% | 19.61% |
+| Non-Hallucination Rate | 82.74% | 80.19% | 80.22% |
+
+### LLM Verifier Findings
+
+The LLM verifier audit shows that DPO-v1 improves answer-seeking behavior, but introduces substantial citation misuse.
+
+DPO-v1 raises gold-correct-or-partial rate from 42.27% to 44.24%, but also increases unfaithful citation rate from 9.45% to 37.70%.
+
+DPO-v2-lightclean reduces the DPO-v1 unfaithful citation rate from 37.70% to 17.29%, a relative reduction of more than 50%. It also preserves most of the answer-quality improvement from DPO-v1.
+
+However, DPO-v2-lightclean does not outperform the baseline on overall hallucination-related metrics. The verifier-labeled hallucination-or-partial rate remains higher than the baseline.
+
 ## Main Findings
 
-DPO-v1 improves answer accuracy and citation formatting, but it also sharply increases citation behavior on unsupported examples.
+1. Baseline remains the strongest system for hallucination calibration and citation faithfulness.
 
-DPO-v2-lightclean preserves most of the supported-answer gains from DPO-v1 while substantially reducing unsupported citation rate.
+   The baseline has the lowest unfaithful citation rate and the lowest verifier-labeled hallucination-or-partial rate.
 
-Key observations:
+2. DPO-v1 produces only modest answer-quality gains.
 
-- DPO-v1 has the highest overall EM/F1.
-- DPO-v1 causes unsupported citation rate to rise from 0.2468 to 0.7766.
-- DPO-v2-lightclean reduces unsupported citation rate from 0.7766 to 0.4025.
-- DPO-v2-lightclean keeps supported F1 close to DPO-v1.
-- Neither DPO-v1 nor DPO-v2-lightclean restores unsupported abstention rate to the baseline level.
+   DPO-v1 has the highest automatic EM/F1 and slightly improves LLM-judged gold correctness, but the improvement is small.
+
+3. DPO-v1 severely amplifies unfaithful citation.
+
+   DPO-v1 dramatically increases citation frequency and unfaithful citation rate. This shows that higher citation rate or valid citation ID rate does not imply faithful citation.
+
+4. DPO-v2-lightclean mitigates citation misuse.
+
+   DPO-v2-lightclean substantially reduces DPO-v1's unfaithful citation problem while preserving most of the supported-answer gains.
+
+5. Weak-label DPO is not sufficient for robust hallucination reduction.
+
+   The weak preference labels are noisy because they rely on gold-answer string matching rather than human-verified or verifier-verified evidence support.
 
 ## Interpretation
 
-DPO-v1 appears to make the model more answer-seeking and citation-seeking. This improves supported-answer performance, but it also encourages citation-formatted answers in unsupported contexts.
+Naive weak-label DPO makes the model more answer-seeking and citation-seeking. This can slightly improve answer accuracy, but it also harms citation faithfulness and hallucination calibration.
 
-DPO-v2-lightclean partially fixes this by using cleaner unsupported pairs and explicit no-citation chosen responses. It significantly reduces unsupported citation rate while preserving most supported-answer gains.
+DPO-v2-lightclean shows that data cleaning and no-citation instructions can reduce one major failure mode: unfaithful citation. However, it does not fully solve answer-level hallucination.
 
-However, unsupported abstention remains below the baseline. This suggests that weak-label DPO alone is not sufficient to fully teach robust evidence-grounded abstention.
+The results suggest that DPO is not automatically hallucination-reducing in RAG. For hallucination reduction, preference data quality is more important than simply optimizing on weak preference pairs.
 
 ## Takeaway
 
-DPO can improve RAG answerability and citation behavior, but naive weak-label DPO may amplify citation-style hallucination.
+Weak-label DPO improves answerability only modestly and can amplify citation-style hallucination.
 
-A cleaner DPO construction reduces this effect, but further work is needed to improve abstention behavior on unsupported retrieval contexts.
+Cleaner DPO construction reduces citation misuse, but the baseline remains better on overall hallucination and citation-faithfulness metrics.
+
+Future DPO-based hallucination reduction likely requires higher-quality preference labels, such as human annotation, LLM-verifier labels, or NLI-based support verification.
 
 ## Scripts
 
@@ -199,6 +280,7 @@ scripts/05_eval_generation.py
 scripts/06_build_dpo_data.py
 scripts/07_train_dpo.py
 scripts/08_generate_dpo.py
+scripts/09_llm_verifier_audit.py
 ```
 
 ## Reproduction Commands
@@ -281,6 +363,31 @@ python scripts/05_eval_generation.py \
   --per_example_output outputs/dpo/dpo_v2_u2_lightclean_val_eval_top10_full.jsonl
 ```
 
+### Run LLM Verifier Audit
+
+Set API credentials first:
+
+```bash
+export OPENAI_API_KEY="your_api_key"
+export OPENAI_BASE_URL="your_openai_compatible_base_url"
+```
+
+Run full validation audit:
+
+```bash
+python scripts/09_llm_verifier_audit.py \
+  --baseline_eval outputs/baseline/base_val_eval_top10_full.jsonl \
+  --dpo_v1_eval outputs/dpo/dpo_val_eval_top10_full.jsonl \
+  --dpo_v2_eval outputs/dpo/dpo_v2_u2_lightclean_val_eval_top10_full.jsonl \
+  --output_file results/llm_verifier_audit_val_all_ecnu_v2.jsonl \
+  --summary_file results/llm_verifier_audit_val_all_ecnu_v2_summary.json \
+  --sample_size 0 \
+  --split all \
+  --model ecnu-plus \
+  --base_url https://chat.ecnu.edu.cn/open/api/v1 \
+  --resume
+```
+
 ## Repository Contents
 
 Recommended repository structure:
@@ -301,12 +408,14 @@ rag_dpo_hallucination/
     06_build_dpo_data.py
     07_train_dpo.py
     08_generate_dpo.py
+    09_llm_verifier_audit.py
 
   results/
     baseline_vs_dpo_v1_v2.md
     baseline_val_metrics_top10_full.json
     dpo_v1_val_metrics_top10_full.json
     dpo_v2_lightclean_val_metrics_top10_full.json
+    llm_verifier_audit_val_all_ecnu_v2_summary.json
 
   examples/
     dpo_supported_examples.jsonl
@@ -330,12 +439,29 @@ logs/
 
 The LoRA adapter checkpoints are not included in the repository. They should be stored separately, for example on Hugging Face Hub or cloud storage.
 
+API keys and local environment files should not be committed:
+
+```text
+.env
+*.env
+```
+
+## Limitations
+
+- The preference data is constructed from weak automatic labels, not human annotations.
+- The automatic supported/unsupported split is based on gold-answer string matching.
+- Automatic citation validity only checks citation IDs, not citation faithfulness.
+- The LLM verifier audit is stronger than string matching, but still depends on the judge model.
+- The generator is a 7B instruct model, which may limit long-context citation and abstention behavior.
+- The project does not include human-labeled preference data.
+
 ## Future Work
 
 - Run prompt ablation with stricter citation rules:
   - If the answer is insufficient evidence, do not cite any passage.
-- Add verifier-based filtering for supported and unsupported preference pairs.
+- Build verifier-labeled preference data instead of weak string-match labels.
 - Use an LLM or NLI model to check whether passages actually support the chosen answer.
 - Evaluate citation faithfulness beyond citation format validity.
 - Add list-aware evaluation for multi-answer NQ examples.
 - Compare DPO-only, SFT-only, and SFT+DPO variants.
+- Test stronger base models with better RAG and citation-following ability.
