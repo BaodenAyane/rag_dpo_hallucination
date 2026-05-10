@@ -1,0 +1,19 @@
+{
+  "num_examples": 200,
+  "models": {
+    "dpo_v1": {
+      "no": {
+        "count": 189,
+        "rate": 0.945
+      },
+      "partial": {
+        "count": 8,
+        "rate": 0.04
+      },
+      "yes": {
+        "count": 3,
+        "rate": 0.015
+      }
+    }
+  }
+}
